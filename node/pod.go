@@ -135,10 +135,6 @@ func (pc *PodController) deletePod(ctx context.Context, namespace, name string) 
 	// NOTE: Some providers return a non-nil error in their GetPod implementation when the pod is not found while some other don't.
 	// Hence, we ignore the error and just act upon the pod if it is non-nil (meaning that the provider still knows about the pod).
 	pod, _ := pc.provider.GetPod(ctx, namespace, name)
-	if pod == nil {
-		// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-		return pc.forceDeletePodResource(ctx, namespace, name)
-	}
 
 	ctx, span := trace.StartSpan(ctx, "deletePod")
 	defer span.End()
@@ -151,35 +147,6 @@ func (pc *PodController) deletePod(ctx context.Context, namespace, name string) 
 	}
 
 	log.G(ctx).Debug("Deleted pod from provider")
-
-	if !errors.IsNotFound(delErr) {
-		if err := pc.forceDeletePodResource(ctx, namespace, name); err != nil {
-			span.SetStatus(err)
-			return err
-		}
-		log.G(ctx).Info("Deleted pod from Kubernetes")
-	}
-
-	return nil
-}
-
-func (pc *PodController) forceDeletePodResource(ctx context.Context, namespace, name string) error {
-	ctx, span := trace.StartSpan(ctx, "forceDeletePodResource")
-	defer span.End()
-	ctx = span.WithFields(ctx, log.Fields{
-		"namespace": namespace,
-		"name":      name,
-	})
-
-	var grace int64
-	if err := pc.client.Pods(namespace).Delete(name, &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
-		if errors.IsNotFound(err) {
-			log.G(ctx).Debug("Pod does not exist in Kubernetes, nothing to delete")
-			return nil
-		}
-		span.SetStatus(err)
-		return pkgerrors.Wrap(err, "Failed to delete Kubernetes pod")
-	}
 	return nil
 }
 
