@@ -177,23 +177,11 @@ func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.Rate
 	ctx = span.WithField(ctx, "nPods", int64(len(pods)))
 
 	for _, pod := range pods {
-		if !shouldSkipPodStatusUpdate(pod) {
-			enqueuePodStatusUpdate(ctx, q, pod)
-		}
+		enqueuePodStatusUpdate(ctx, q, pod)
 	}
-}
-
-func shouldSkipPodStatusUpdate(pod *corev1.Pod) bool {
-	return pod.Status.Phase == corev1.PodSucceeded ||
-		pod.Status.Phase == corev1.PodFailed ||
-		pod.Status.Reason == podStatusReasonProviderFailed
 }
 
 func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) error {
-	if shouldSkipPodStatusUpdate(pod) {
-		return nil
-	}
-
 	ctx, span := trace.StartSpan(ctx, "updatePodStatus")
 	defer span.End()
 	ctx = addPodAttributes(ctx, span, pod)
@@ -201,6 +189,7 @@ func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) e
 	status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
 	if err != nil && !errdefs.IsNotFound(err) {
 		span.SetStatus(err)
+		log.G(ctx).Errorf("Failed to retrieve pod status: %s, name: %s", pod.Namespace, pod.Name)
 		return pkgerrors.Wrap(err, "error retreiving pod status")
 	}
 
@@ -255,7 +244,7 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 	defer span.End()
 
 	ctx = span.WithField(ctx, "key", key)
-	log.G(ctx).Debug("processing pod status update")
+	log.G(ctx).Infof("processing pod status update for key: %s", key)
 	defer func() {
 		span.SetStatus(retErr)
 		if retErr != nil {
@@ -267,9 +256,11 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 	if err != nil {
 		return pkgerrors.Wrap(err, "error spliting cache key")
 	}
+	log.G(ctx).Infof("processing pod status update for namespace: %s, name: %s", namespace, name)
 
 	pod, err := pc.podsLister.Pods(namespace).Get(name)
 	if err != nil {
+		log.G(ctx).WithError(err).Error("Failed to retrieve pod for namespace: %s, name: %s", namespace, name)
 		if errors.IsNotFound(err) {
 			log.G(ctx).WithError(err).Debug("Skipping pod status update for pod missing in Kubernetes")
 			return nil
@@ -277,5 +268,6 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 		return pkgerrors.Wrap(err, "error looking up pod")
 	}
 
+	log.G(ctx).Infof("Updating pod status for real for key: %s", key)
 	return pc.updatePodStatus(ctx, pod)
 }
