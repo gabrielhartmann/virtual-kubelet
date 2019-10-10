@@ -133,61 +133,19 @@ func (pc *PodController) handleProviderError(ctx context.Context, span trace.Spa
 	span.SetStatus(origErr)
 }
 
-func (pc *PodController) deletePod(ctx context.Context, namespace, name string) error {
+func (pc *PodController) deletePod(ctx context.Context, pod *corev1.Pod) error {
 	ctx, span := trace.StartSpan(ctx, "deletePod")
 	defer span.End()
-
-	pod, err := pc.provider.GetPod(ctx, namespace, name)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-			return pc.forceDeletePodResource(ctx, namespace, name)
-		}
-		return err
-	}
-
-	// NOTE: Some providers return a non-nil error in their GetPod implementation when the pod is not found while some other don't.
-	if pod == nil {
-		// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-		return pc.forceDeletePodResource(ctx, namespace, name)
-	}
-
 	ctx = addPodAttributes(ctx, span, pod)
 
-	var delErr error
-	if delErr = pc.provider.DeletePod(ctx, pod.DeepCopy()); delErr != nil && !errdefs.IsNotFound(delErr) {
-		span.SetStatus(delErr)
-		return delErr
+	err := pc.provider.DeletePod(ctx, pod.DeepCopy())
+	if err != nil {
+		span.SetStatus(err)
+		return err
 	}
 
 	log.G(ctx).Debug("Deleted pod from provider")
 
-	if err := pc.forceDeletePodResource(ctx, namespace, name); err != nil {
-		span.SetStatus(err)
-		return err
-	}
-	log.G(ctx).Info("Deleted pod from Kubernetes")
-
-	return nil
-}
-
-func (pc *PodController) forceDeletePodResource(ctx context.Context, namespace, name string) error {
-	ctx, span := trace.StartSpan(ctx, "forceDeletePodResource")
-	defer span.End()
-	ctx = span.WithFields(ctx, log.Fields{
-		"namespace": namespace,
-		"name":      name,
-	})
-
-	var grace int64
-	if err := pc.client.Pods(namespace).Delete(name, &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
-		if errors.IsNotFound(err) {
-			log.G(ctx).Debug("Pod does not exist in Kubernetes, nothing to delete")
-			return nil
-		}
-		span.SetStatus(err)
-		return pkgerrors.Wrap(err, "Failed to delete Kubernetes pod")
-	}
 	return nil
 }
 
@@ -279,4 +237,52 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 	}
 
 	return pc.updatePodStatus(ctx, pod, key)
+}
+
+func (pc *PodController) deletePodHandler(ctx context.Context, key string) error {
+	ctx, span := trace.StartSpan(ctx, "processDeletionReconcilationWorkItem")
+	defer span.End()
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	ctx = span.WithFields(ctx, log.Fields{
+		"namespace": namespace,
+		"name":      name,
+	})
+
+	if err != nil {
+		// Log the error as a warning, but do not requeue the key as it is invalid.
+		log.G(ctx).Warn(pkgerrors.Wrapf(err, "invalid resource key: %q", key))
+		return nil
+	}
+
+	// If the pod has been deleted from API server, we don't need to do anything.
+	k8sPod, err := pc.podsLister.Pods(namespace).Get(name)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+
+	// We check if the pod still exists in the provider. If it no longer there, then we can proceed to
+	// delete it from API server. Otherwise, we keep the pod around (in api server), in case there is a pending
+	// status update to be propagated.
+	pod, err := pc.provider.GetPod(ctx, namespace, name)
+	if err != nil && !errdefs.IsNotFound(err) {
+		span.SetStatus(err)
+		return err
+	}
+
+	if pod != nil {
+		log.G(ctx).Warn("Container still exists in provider, requeueing")
+		pc.deletionQ.AddRateLimited(key)
+		return nil
+	}
+
+	err = pc.client.Pods(namespace).Delete(name, metav1.NewDeleteOptions(0))
+	if err != nil && !errors.IsNotFound(err) {
+		span.SetStatus(err)
+		return err
+	}
+	if !notRunning(&k8sPod.Status) {
+		log.G(ctx).Warn("Pod had to be force deleted after grace period because the PodLifecycleHandler did not generate a pod status in which all the containers were in a terminal state")
+	}
+	return nil
 }
