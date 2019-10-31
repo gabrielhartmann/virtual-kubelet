@@ -265,7 +265,7 @@ func (pc *PodController) deletePodHandler(ctx context.Context, key string) error
 		return err
 	}
 
-	if running(&k8sPod.Status) {
+	if anyRunning(ctx, &k8sPod.Status) {
 		log.G(ctx).Error("Force deleting pod in running state")
 	}
 

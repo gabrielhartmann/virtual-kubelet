@@ -405,6 +405,7 @@ func (pc *PodController) syncHandler(ctx context.Context, key string) error {
 		return err
 
 	}
+
 	// At this point we know the Pod resource has either been created or updated (which includes being marked for deletion).
 	return pc.syncPodInProvider(ctx, pod, key)
 }
@@ -419,7 +420,7 @@ func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod,
 
 	// If the pod('s containers) is no longer in a running state then we force-delete the pod from API server
 	// more context is here: https://github.com/virtual-kubelet/virtual-kubelet/pull/760
-	if pod.DeletionTimestamp != nil && !running(&pod.Status) {
+	if !active(ctx, &pod.Status) {
 		log.G(ctx).Debug("Force deleting pod from API Server as it is no longer running")
 		pc.deletionQ.Add(key)
 		return nil
@@ -595,13 +596,30 @@ func podsEffectivelyEqual(p1, p2 *corev1.Pod) bool {
 	return cmp.Equal(p1, p2, cmp.FilterPath(filterForResourceVersion, cmp.Ignore()))
 }
 
-// borrowed from https://github.com/kubernetes/kubernetes/blob/f64c631cd7aea58d2552ae2038c1225067d30dde/pkg/kubelet/kubelet_pods.go#L944-L953
-// running returns true, unless if every status is terminated or waiting, or the status list
-// is empty.
-func running(podStatus *corev1.PodStatus) bool {
+type ContainerStateCheckFunc func(containerState *corev1.ContainerState) bool
+
+func active(ctx context.Context, podStatus *corev1.PodStatus) bool {
+	if podStatus.Phase == corev1.PodSucceeded || podStatus.Phase == corev1.PodFailed {
+		if anyRunning(ctx, podStatus) {
+			return true
+		}
+
+		return false
+	}
+
+	return true
+}
+
+func anyRunning(ctx context.Context, podStatus *corev1.PodStatus) bool {
+	return anyContainerHasStatus(ctx, podStatus, func(containerState *corev1.ContainerState) bool {
+		return containerState.Running != nil
+	})
+}
+
+func anyContainerHasStatus(ctx context.Context, podStatus *corev1.PodStatus, containerStateCheck ContainerStateCheckFunc) bool {
 	statuses := podStatus.ContainerStatuses
 	for _, status := range statuses {
-		if status.State.Terminated == nil && status.State.Waiting == nil {
+		if containerStateCheck(&status.State) {
 			return true
 		}
 	}
