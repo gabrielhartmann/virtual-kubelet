@@ -51,7 +51,16 @@ type NodeProvider interface { //nolint:golint
 	// the status.
 	//
 	// NotifyNodeStatus should not block callers.
+	//
+	// Deprecated: Asynchronous NodeStatus updates do not align with the Kubelet
+	// approach and interfere with other components which may wish to modify
+	// NodeStatus
 	NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node))
+
+	// SetNodeStatus allows the NodeProvider to make whatever changes to
+	// NodeStatus for those elements on which it is authoritative.  All other
+	// elements should be left unmodified.
+	SetNodeStatus(ctx context.Context, node *corev1.Node)
 }
 
 // NewNodeController creates a new node controller.
@@ -152,7 +161,6 @@ type NodeController struct { // nolint: golint
 	pingInterval   time.Duration
 	statusInterval time.Duration
 	lease          *coord.Lease
-	chStatusUpdate chan *corev1.Node
 
 	nodeStatusUpdateErrorHandler ErrorHandler
 
@@ -184,11 +192,6 @@ func (n *NodeController) Run(ctx context.Context) error {
 	if n.statusInterval == time.Duration(0) {
 		n.statusInterval = DefaultStatusUpdateInterval
 	}
-
-	n.chStatusUpdate = make(chan *corev1.Node)
-	n.p.NotifyNodeStatus(ctx, func(node *corev1.Node) {
-		n.chStatusUpdate <- node
-	})
 
 	if err := n.ensureNode(ctx); err != nil {
 		return err
@@ -244,12 +247,8 @@ func (n *NodeController) controlLoop(ctx context.Context) error {
 
 	statusTimer := time.NewTimer(n.statusInterval)
 	defer statusTimer.Stop()
-	timerResetDuration := n.statusInterval
-	if n.disableLease {
-		// when resetting the timer after processing a status update, reset it to the ping interval
-		// (since it will be the ping timer as n.disableLease == true)
-		timerResetDuration = n.pingInterval
 
+	if n.disableLease {
 		// hack to make sure this channel always blocks since we won't be using it
 		if !statusTimer.Stop() {
 			<-statusTimer.C
@@ -262,26 +261,6 @@ func (n *NodeController) controlLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case updated := <-n.chStatusUpdate:
-			var t *time.Timer
-			if n.disableLease {
-				t = pingTimer
-			} else {
-				t = statusTimer
-			}
-
-			log.G(ctx).Debug("Received node status update")
-			// Performing a status update so stop/reset the status update timer in this
-			// branch otherwise there could be an unnecessary status update.
-			if !t.Stop() {
-				<-t.C
-			}
-
-			n.n.Status = updated.Status
-			if err := n.updateStatus(ctx, false); err != nil {
-				log.G(ctx).WithError(err).Error("Error handling node status update")
-			}
-			t.Reset(timerResetDuration)
 		case <-statusTimer.C:
 			if err := n.updateStatus(ctx, false); err != nil {
 				log.G(ctx).WithError(err).Error("Error handling node status update")
@@ -327,9 +306,8 @@ func (n *NodeController) updateLease(ctx context.Context) error {
 }
 
 func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) error {
-	updateNodeStatusHeartbeat(n.n)
 
-	node, err := updateNodeStatus(ctx, n.nodes, n.n)
+	node, err := updateNodeStatus(ctx, n.nodes, n.n.Name, n.p)
 	if err != nil {
 		if skipErrorCb || n.nodeStatusUpdateErrorHandler == nil {
 			return err
@@ -338,7 +316,7 @@ func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) err
 			return err
 		}
 
-		node, err = updateNodeStatus(ctx, n.nodes, n.n)
+		node, err = updateNodeStatus(ctx, n.nodes, n.n.Name, n.p)
 		if err != nil {
 			return err
 		}
@@ -450,36 +428,34 @@ func preparePatchBytesforNodeStatus(nodeName types.NodeName, oldNode *corev1.Nod
 //
 // If you use this function, it is up to you to synchronize this with other operations.
 // This reduces the time to second-level precision.
-func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, n *corev1.Node) (_ *corev1.Node, retErr error) {
+func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, nodeName string, nodeProvider NodeProvider) (_ *corev1.Node, retErr error) {
 	ctx, span := trace.StartSpan(ctx, "UpdateNodeStatus")
 	defer func() {
 		span.End()
 		span.SetStatus(retErr)
 	}()
 
-	var node *corev1.Node
-
-	oldNode, err := nodes.Get(n.Name, emptyGetOptions)
+	oldNode, err := nodes.Get(nodeName, emptyGetOptions)
 	if err != nil {
 		return nil, err
 	}
+	log.G(ctx).WithField("node.Status.Conditions", oldNode.Status.Conditions).
+		Info("got node from api server")
 
-	log.G(ctx).Debug("got node from api server")
-	node = oldNode.DeepCopy()
-	node.ResourceVersion = ""
-	node.Status = n.Status
-
+	node := oldNode.DeepCopy()
+	nodeProvider.SetNodeStatus(ctx, node)
 	ctx = addNodeAttributes(ctx, span, node)
+	updateNodeStatusHeartbeat(node)
 
 	// Patch the node status to merge other changes on the node.
-	updated, _, err := patchNodeStatus(nodes, types.NodeName(n.Name), oldNode, node)
+	updated, _, err := patchNodeStatus(nodes, types.NodeName(node.Name), oldNode, node)
 	if err != nil {
 		return nil, err
 	}
 
 	log.G(ctx).WithField("node.resourceVersion", updated.ResourceVersion).
 		WithField("node.Status.Conditions", updated.Status.Conditions).
-		Debug("updated node status in api server")
+		Info("updated node status in api server")
 	return updated, nil
 }
 
@@ -531,6 +507,13 @@ func (NaiveNodeProvider) Ping(ctx context.Context) error {
 // This NaiveNodeProvider does not support updating node status and so this
 // function is a no-op.
 func (NaiveNodeProvider) NotifyNodeStatus(ctx context.Context, f func(*corev1.Node)) {
+}
+
+// SetNodeStatus implements the NodeProvider interface.
+//
+// This NaiveNodeProvider does not support updating node status and so this
+// function is a no-op.
+func (NaiveNodeProvider) SetNodeStatus(ctx context.Context, node *corev1.Node) {
 }
 
 type taintsStringer []corev1.Taint

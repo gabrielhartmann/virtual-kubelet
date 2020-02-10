@@ -239,6 +239,13 @@ func TestEnsureLease(t *testing.T) {
 	assert.Check(t, timeEqual(l2.Spec.RenewTime.Time, l1.Spec.RenewTime.Time))
 }
 
+type runningNodeProvider struct {
+	NaiveNodeProvider
+}
+func (runningNodeProvider) SetNodeStatus(ctx context.Context, node *corev1.Node) {
+	node.Status.Phase = corev1.NodeRunning
+}
+
 func TestUpdateNodeStatus(t *testing.T) {
 	n := testNode(t)
 	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
@@ -248,22 +255,21 @@ func TestUpdateNodeStatus(t *testing.T) {
 	nodes := testclient.NewSimpleClientset().CoreV1().Nodes()
 
 	ctx := context.Background()
-	updated, err := updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err := updateNodeStatus(ctx, nodes, n.Name, NaiveNodeProvider{})
 	assert.Equal(t, errors.IsNotFound(err), true, err)
 
 	_, err = nodes.Create(n)
 	assert.NilError(t, err)
 
-	updated, err = updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err = updateNodeStatus(ctx, nodes, n.Name, NaiveNodeProvider{})
 	assert.NilError(t, err)
 
 	assert.NilError(t, err)
 	assert.Check(t, cmp.DeepEqual(n.Status, updated.Status))
 
-	n.Status.Phase = corev1.NodeRunning
-	updated, err = updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err = updateNodeStatus(ctx, nodes, n.Name, runningNodeProvider{})
 	assert.NilError(t, err)
-	assert.Check(t, cmp.DeepEqual(n.Status, updated.Status))
+	assert.Check(t, cmp.DeepEqual(corev1.NodeRunning, updated.Status.Phase))
 
 	err = nodes.Delete(n.Name, nil)
 	assert.NilError(t, err)
@@ -271,8 +277,50 @@ func TestUpdateNodeStatus(t *testing.T) {
 	_, err = nodes.Get(n.Name, metav1.GetOptions{})
 	assert.Equal(t, errors.IsNotFound(err), true, err)
 
-	_, err = updateNodeStatus(ctx, nodes, updated.DeepCopy())
+	updated, err = updateNodeStatus(ctx, nodes, n.Name, NaiveNodeProvider{})
 	assert.Equal(t, errors.IsNotFound(err), true, err)
+}
+
+func TestUpdateNodeConditions(t *testing.T) {
+	// Create a "Running" node
+	n := testNode(t)
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:              "Ready",
+		Status:            corev1.ConditionTrue,
+		LastHeartbeatTime: metav1.Now().Rfc3339Copy(),
+		LastTransitionTime: metav1.Now().Rfc3339Copy(),
+		Reason:            "KubeletReady",
+		Message:           "kubelet is ready.",
+	})
+	n.Status.Phase = corev1.NodeRunning
+	nodes := testclient.NewSimpleClientset().CoreV1().Nodes()
+	n, err := nodes.Create(n)
+	assert.NilError(t, err)
+
+	// Add a NodeCondition out-of-band (e.g. node-problem-detector)
+	npdNode := n.DeepCopy()
+	npdNode.Status.Conditions = append(npdNode.Status.Conditions, corev1.NodeCondition{
+		Type:               "CustomProblem",
+		Status:             "False",
+		LastHeartbeatTime:  metav1.Now().Rfc3339Copy(),
+		LastTransitionTime: metav1.Now().Rfc3339Copy(),
+		Reason:             "CustomReason",
+		Message:            "custom message",
+	})
+	apiNode, err := nodes.Update(npdNode)
+
+	// The node in the API server should now be the node with the added NodeCondition
+	assert.NilError(t, err)
+	assert.Check(t, cmp.DeepEqual(apiNode, npdNode))
+
+	nodeProvider := NaiveNodeProvider{}
+
+	// Now update the Node again from VK, which does not know about the out of band update.
+	// This should not alter or remove the NodeCondition added out of band.
+	ctx := context.Background()
+	updated, err := updateNodeStatus(ctx, nodes, n.Name, nodeProvider)
+	assert.NilError(t, err)
+	assert.Check(t, cmp.DeepEqual(npdNode, updated))
 }
 
 func TestUpdateNodeLease(t *testing.T) {
